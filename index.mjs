@@ -364,6 +364,54 @@ async function handleLogin(event, log, logs) {
         logs
       );
     }
+
+    // ✅ Ensure username/email indexes exist
+    const emailKey = `users/by-email/${accountJson.email.toLowerCase()}.json`;
+    const putIndexOps = [];
+
+    // Check username index
+    try {
+      await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: usernameKey }));
+    } catch (err) {
+      if (err.name === "NoSuchKey") {
+        putIndexOps.push(
+          s3.send(
+            new PutObjectCommand({
+              Bucket: BUCKET,
+              Key: usernameKey,
+              Body: JSON.stringify({ userId }),
+              ContentType: "application/json",
+            })
+          )
+        );
+        log("⚠️ Missing username index recreated");
+      }
+    }
+
+    // Check email index
+    try {
+      await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: emailKey }));
+    } catch (err) {
+      if (err.name === "NoSuchKey") {
+        putIndexOps.push(
+          s3.send(
+            new PutObjectCommand({
+              Bucket: BUCKET,
+              Key: emailKey,
+              Body: JSON.stringify({ userId }),
+              ContentType: "application/json",
+            })
+          )
+        );
+        log("⚠️ Missing email index recreated");
+      }
+    }
+
+    if (putIndexOps.length) {
+      await Promise.all(putIndexOps);
+    }
+
+    // Load config (if exists)
     let configJson = {};
     try {
       const configRes = await s3.send(
@@ -376,6 +424,7 @@ async function handleLogin(event, log, logs) {
     } catch (err) {
       log("⚠️ Config load failed, returning empty config:", err.message);
     }
+
     const token = jwt.sign({ userId, username }, JWT_SECRET, {
       expiresIn: JWT_EXPIRY,
     });
@@ -464,7 +513,119 @@ async function handleGetAccount(event, log, logs) {
     );
   }
 }
+// --- REBUILD INDEXES ---
+async function handleRebuildIndexes(event, log, logs) {
+  try {
+    let ContinuationToken = undefined;
+    let rebuilt = 0;
+    let skipped = 0;
 
+    do {
+      const listRes = await s3.send(
+        new ListObjectsV2Command({
+          Bucket: BUCKET,
+          Prefix: "users/",
+          ContinuationToken,
+        })
+      );
+
+      const accountKeys = (listRes.Contents || [])
+        .map((obj) => obj.Key)
+        .filter((k) => k.endsWith("account.json"));
+
+      for (const key of accountKeys) {
+        const userId = key.split("/")[1]; // users/<uuid>/account.json
+        try {
+          const accountRes = await s3.send(
+            new GetObjectCommand({ Bucket: BUCKET, Key: key })
+          );
+          const accountJson = JSON.parse(
+            await accountRes.Body.transformToString()
+          );
+
+          const usernameKey = `users/by-username/${accountJson.username.toLowerCase()}.json`;
+          const emailKey = `users/by-email/${accountJson.email.toLowerCase()}.json`;
+
+          let needUsername = false;
+          let needEmail = false;
+
+          try {
+            await s3.send(
+              new GetObjectCommand({ Bucket: BUCKET, Key: usernameKey })
+            );
+          } catch (err) {
+            if (err.name === "NoSuchKey") needUsername = true;
+          }
+
+          try {
+            await s3.send(
+              new GetObjectCommand({ Bucket: BUCKET, Key: emailKey })
+            );
+          } catch (err) {
+            if (err.name === "NoSuchKey") needEmail = true;
+          }
+
+          const ops = [];
+          if (needUsername) {
+            ops.push(
+              s3.send(
+                new PutObjectCommand({
+                  Bucket: BUCKET,
+                  Key: usernameKey,
+                  Body: JSON.stringify({ userId }),
+                  ContentType: "application/json",
+                })
+              )
+            );
+          }
+          if (needEmail) {
+            ops.push(
+              s3.send(
+                new PutObjectCommand({
+                  Bucket: BUCKET,
+                  Key: emailKey,
+                  Body: JSON.stringify({ userId }),
+                  ContentType: "application/json",
+                })
+              )
+            );
+          }
+
+          if (ops.length) {
+            await Promise.all(ops);
+            rebuilt++;
+            log(`Rebuilt index for userId=${userId}`);
+          } else {
+            skipped++;
+          }
+        } catch (err) {
+          log("❌ Failed processing account:", key, err.message);
+        }
+      }
+
+      ContinuationToken = listRes.IsTruncated
+        ? listRes.NextContinuationToken
+        : undefined;
+    } while (ContinuationToken);
+
+    return jsonResponse(
+      200,
+      "SUCCESS_REBUILD_INDEXES",
+      "✅ Index rebuild complete",
+      { rebuilt, skipped },
+      logs
+    );
+  } catch (err) {
+    log("❌ Rebuild failed:", err.message);
+    return jsonResponse(
+      500,
+      "ERR_REBUILD_FAILED",
+      `❌ Rebuild failed: ${err.message}`,
+      {},
+      logs
+    );
+  }
+}
 // --- GET CONFIG ---
 async function handleGetConfig(event, log, logs) {
   let body;
