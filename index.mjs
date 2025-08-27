@@ -454,7 +454,7 @@ async function handleGetAccount(event, log, logs) {
   }
 }
 // --- REBUILD INDEXES ---
-async function rebuildIndexes() {
+async function handleRebuildIndexes() {
   console.log("Rebuilding indexes...");
   const db = await getDatabaseConnection();
 
