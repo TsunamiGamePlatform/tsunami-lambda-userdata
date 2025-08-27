@@ -7,7 +7,7 @@ import {
   ListObjectsV2Command,
 } from "@aws-sdk/client-s3";
 import jwt from "jsonwebtoken";
-
+import sanitizeHtml from "xss-filters";
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRY = "7d";
 
@@ -100,7 +100,18 @@ async function handleCreateAccount(event, log, logs) {
 
   const { username, password, email, birthday } = body;
   log("Fields received:", { username, email, birthday });
-  if (!username || !password || !email || !birthday)
+
+  // Sanitize all inputs
+  const sanitizedUsername = sanitizeHtml(username);
+  const sanitizedEmail = sanitizeHtml(email);
+  const sanitizedBirthday = sanitizeHtml(birthday);
+
+  if (
+    !sanitizedUsername ||
+    !sanitizedPassword ||
+    !sanitizedEmail ||
+    !sanitizedBirthday
+  )
     return jsonResponse(
       400,
       "ERR_MISSING_FIELDS",
@@ -226,7 +237,11 @@ async function handleLogin(event, log, logs) {
 
   const { username, password } = body;
   log("Fields received:", { username });
-  if (!username || !password)
+
+  // Sanitize inputs
+  const sanitizedUsername = sanitizeHtml(username);
+
+  if (!sanitizedUsername || !password)
     return jsonResponse(
       400,
       "ERR_MISSING_FIELDS",
@@ -688,6 +703,7 @@ async function handleUpdateSetting(event, log, logs) {
 
   const { key, value, token } = body;
   let userId;
+
   try {
     userId = jwt.verify(token, JWT_SECRET).userId;
   } catch (err) {
@@ -710,6 +726,17 @@ async function handleUpdateSetting(event, log, logs) {
       logs
     );
 
+  // Sanitize inputs
+  const sanitizedKey = sanitizeHtml(key);
+  const sanitizedValue = sanitizeHtml(value);
+
+  if (sanitizedKey !== key || sanitizedValue !== value) {
+    log("⚠️ Input sanitization warning:", {
+      original: { key, value },
+      sanitized: { sanitizedKey, sanitizedValue },
+    });
+  }
+
   try {
     const configRes = await s3.send(
       new GetObjectCommand({
@@ -718,7 +745,7 @@ async function handleUpdateSetting(event, log, logs) {
       })
     );
     const config = JSON.parse(await configRes.Body.transformToString());
-    config[key] = value;
+    config[sanitizedKey] = sanitizedValue;
 
     await s3.send(
       new PutObjectCommand({
