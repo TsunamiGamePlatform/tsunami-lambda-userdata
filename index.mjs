@@ -7,7 +7,7 @@ import {
   ListObjectsV2Command,
 } from "@aws-sdk/client-s3";
 import jwt from "jsonwebtoken";
-import sanitizeHtml from "xss-filters";
+import DOMPurify from "dompurify";
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRY = "7d";
 
@@ -102,9 +102,10 @@ async function handleCreateAccount(event, log, logs) {
   log("Fields received:", { username, email, birthday });
 
   // Sanitize all inputs
-  const sanitizedUsername = sanitizeHtml(username);
-  const sanitizedEmail = sanitizeHtml(email);
-  const sanitizedBirthday = sanitizeHtml(birthday);
+  const sanitizedUsername = DOMPurify.sanitize(username);
+  const sanitizedPassword = DOMPurify.sanitize(password);
+  const sanitizedEmail = DOMPurify.sanitize(email);
+  const sanitizedBirthday = DOMPurify.sanitize(birthday);
 
   if (
     !sanitizedUsername ||
@@ -239,7 +240,7 @@ async function handleLogin(event, log, logs) {
   log("Fields received:", { username });
 
   // Sanitize inputs
-  const sanitizedUsername = sanitizeHtml(username);
+  const sanitizedUsername = DOMPurify.sanitize(username);
 
   if (!sanitizedUsername || !password)
     return jsonResponse(
@@ -727,8 +728,8 @@ async function handleUpdateSetting(event, log, logs) {
     );
 
   // Sanitize inputs
-  const sanitizedKey = sanitizeHtml(key);
-  const sanitizedValue = sanitizeHtml(value);
+  const sanitizedKey = DOMPurify.sanitize(key);
+  const sanitizedValue = DOMPurify.sanitize(value);
 
   if (sanitizedKey !== key || sanitizedValue !== value) {
     log("⚠️ Input sanitization warning:", {
