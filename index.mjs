@@ -454,70 +454,117 @@ async function handleGetAccount(event, log, logs) {
   }
 }
 // --- REBUILD INDEXES ---
-async function handleRebuildIndexes() {
-  console.log("Rebuilding indexes...");
-  const db = await getDatabaseConnection();
+async function handleRebuildIndexes(event, log, logs) {
+  try {
+    let ContinuationToken = undefined;
+    let rebuilt = 0;
+    let skipped = 0;
 
-  // Get all users from the database
-  const allUsers = await db.query("SELECT * FROM users");
+    do {
+      const listRes = await s3.send(
+        new ListObjectsV2Command({
+          Bucket: BUCKET,
+          Prefix: "users/",
+          ContinuationToken,
+        })
+      );
 
-  // Create a set of user IDs from the database
-  const dbUserIds = new Set(allUsers.map((user) => user.id));
+      const accountKeys = (listRes.Contents || [])
+        .map((obj) => obj.Key)
+        .filter((k) => k.endsWith("account.json"));
 
-  // Get all indexed users (this is where we'll compare)
-  const indexedUsers = await db.query(
-    "SELECT id, username, email, password_hash, birthday FROM indexed_users"
-  );
+      for (const key of accountKeys) {
+        const userId = key.split("/")[1]; // users/<uuid>/account.json
+        try {
+          const accountRes = await s3.send(
+            new GetObjectCommand({ Bucket: BUCKET, Key: key })
+          );
+          const accountJson = JSON.parse(
+            await accountRes.Body.transformToString()
+          );
 
-  // Create a set of user IDs from indexed users
-  const indexedUserIds = new Set(indexedUsers.map((user) => user.id));
+          const usernameKey = `users/by-username/${accountJson.username.toLowerCase()}.json`;
+          const emailKey = `users/by-email/${accountJson.email.toLowerCase()}.json`;
 
-  // Find users that exist in the database but not in indexed_users
-  const usersToAdd = allUsers.filter((user) => !indexedUserIds.has(user.id));
+          let needUsername = false;
+          let needEmail = false;
 
-  // Find users that exist in indexed_users but not in the database
-  const usersToRemove = indexedUsers.filter((user) => !dbUserIds.has(user.id));
+          try {
+            await s3.send(
+              new GetObjectCommand({ Bucket: BUCKET, Key: usernameKey })
+            );
+          } catch (err) {
+            if (err.name === "NoSuchKey") needUsername = true;
+          }
 
-  console.log(`Found ${usersToAdd.length} users to add`);
-  console.log(`Found ${usersToRemove.length} users to remove`);
+          try {
+            await s3.send(
+              new GetObjectCommand({ Bucket: BUCKET, Key: emailKey })
+            );
+          } catch (err) {
+            if (err.name === "NoSuchKey") needEmail = true;
+          }
 
-  if (usersToAdd.length > 0 || usersToRemove.length > 0) {
-    await db.transaction(async (trx) => {
-      // Add new users
-      for (const user of usersToAdd) {
-        await trx("indexed_users")
-          .insert({
-            id: user.id,
-            username: user.username,
-            email: user.email,
-            password_hash: user.password_hash,
-            birthday: user.birthday,
-          })
-          .onConflict((conflict) => {
-            conflict.column("id").doUpdateSet({
-              username: user.username,
-              email: user.email,
-              password_hash: user.password_hash,
-              birthday: user.birthday,
-            });
-          });
+          const ops = [];
+          if (needUsername) {
+            ops.push(
+              s3.send(
+                new PutObjectCommand({
+                  Bucket: BUCKET,
+                  Key: usernameKey,
+                  Body: JSON.stringify({ userId }),
+                  ContentType: "application/json",
+                })
+              )
+            );
+          }
+          if (needEmail) {
+            ops.push(
+              s3.send(
+                new PutObjectCommand({
+                  Bucket: BUCKET,
+                  Key: emailKey,
+                  Body: JSON.stringify({ userId }),
+                  ContentType: "application/json",
+                })
+              )
+            );
+          }
+
+          if (ops.length) {
+            await Promise.all(ops);
+            rebuilt++;
+            log(`Rebuilt index for userId=${userId}`);
+          } else {
+            skipped++;
+          }
+        } catch (err) {
+          log("❌ Failed processing account:", key, err.message);
+        }
       }
 
-      // Remove old users
-      for (const user of usersToRemove) {
-        await trx("indexed_users").delete().where({ id: user.id });
-      }
-    });
+      ContinuationToken = listRes.IsTruncated
+        ? listRes.NextContinuationToken
+        : undefined;
+    } while (ContinuationToken);
 
-    console.log("Indexes rebuilt successfully");
-  } else {
-    console.log("No changes needed in indexes");
+    return jsonResponse(
+      200,
+      "SUCCESS_REBUILD_INDEXES",
+      "✅ Index rebuild complete",
+      { rebuilt, skipped },
+      logs
+    );
+  } catch (err) {
+    log("❌ Rebuild failed:", err.message);
+    return jsonResponse(
+      500,
+      "ERR_REBUILD_FAILED",
+      `❌ Rebuild failed: ${err.message}`,
+      {},
+      logs
+    );
   }
-
-  // Update the last rebuild timestamp
-  await db.query("UPDATE system SET last_rebuild = CURRENT_TIMESTAMP");
-
-  process.exit(0);
 }
 // --- GET CONFIG ---
 async function handleGetConfig(event, log, logs) {
