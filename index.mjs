@@ -7,13 +7,27 @@ import {
   ListObjectsV2Command,
 } from "@aws-sdk/client-s3";
 import jwt from "jsonwebtoken";
-import DOMPurify from "dompurify";
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRY = "7d";
 
 const s3 = new S3Client({ region: "us-east-1" });
 const BUCKET = "click.accountdata";
+function sanitizeHtml(html) {
+  // Remove script and style elements
+  html = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "");
+  html = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
 
+  // Remove comments
+  html = html.replace(/<!--[\s\S]*?-->/g, "");
+
+  // Remove remaining tags
+  html = html.replace(/<\/?[^\s><]+>/g, "");
+
+  // Remove any remaining characters that aren't alphanumeric or spaces
+  html = html.replace(/[^a-zA-Z0-9\s]/g, "");
+
+  return html;
+}
 export async function handler(event) {
   const logs = [];
   const log = (...args) =>
@@ -102,10 +116,10 @@ async function handleCreateAccount(event, log, logs) {
   log("Fields received:", { username, email, birthday });
 
   // Sanitize all inputs
-  const sanitizedUsername = DOMPurify.sanitize(username);
-  const sanitizedPassword = DOMPurify.sanitize(password);
-  const sanitizedEmail = DOMPurify.sanitize(email);
-  const sanitizedBirthday = DOMPurify.sanitize(birthday);
+  const sanitizedUsername = sanitizeHtml(username);
+  const sanitizedPassword = sanitizeHtml(password);
+  const sanitizedEmail = sanitizeHtml(email);
+  const sanitizedBirthday = sanitizeHtml(birthday);
 
   if (
     !sanitizedUsername ||
@@ -240,7 +254,7 @@ async function handleLogin(event, log, logs) {
   log("Fields received:", { username });
 
   // Sanitize inputs
-  const sanitizedUsername = DOMPurify.sanitize(username);
+  const sanitizedUsername = sanitizeHtml(username);
 
   if (!sanitizedUsername || !password)
     return jsonResponse(
@@ -728,8 +742,8 @@ async function handleUpdateSetting(event, log, logs) {
     );
 
   // Sanitize inputs
-  const sanitizedKey = DOMPurify.sanitize(key);
-  const sanitizedValue = DOMPurify.sanitize(value);
+  const sanitizedKey = sanitizeHtml(key);
+  const sanitizedValue = sanitizeHtml(value);
 
   if (sanitizedKey !== key || sanitizedValue !== value) {
     log("⚠️ Input sanitization warning:", {
