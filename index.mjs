@@ -12,20 +12,45 @@ const JWT_EXPIRY = "7d";
 
 const s3 = new S3Client({ region: "us-east-1" });
 const BUCKET = "click.accountdata";
-function sanitizeHtml(html) {
-  // Remove all HTML tags
-  html = html.replace(/<[^>]*>/g, "");
+function sanitizeUsername(username) {
+  // Only allow letters, numbers, and selected safe symbols
+  const dirtyRegex = /[^A-Za-z0-9\-_.!$*+]/g;
+  return dirtyRegex.test(username); // true = dirty/invalid
+}
+function sanitizePassword(password) {
+  // Allow letters, numbers, and common password symbols
+  const dirtyRegex = /[^A-Za-z0-9!$%^&*()\-_=+|;.\]]/g;
+  return dirtyRegex.test(password); // true = dirty/invalid
+}
+function sanitizeSetting(input) {
+  const dirtyRegex = /[^a-z]/g; // anything not a-z is invalid
+  return dirtyRegex.test(input); // true = dirty/invalid
+}
+function sanitizeBirthday(birthday) {
+  // Check ISO format first
+  const isoRegex = /^\d{4}-\d{2}-\d{2}$/;
+  if (!isoRegex.test(birthday)) return true; // invalid
 
-  // Remove special characters
-  html = html.replace(/[<>\"\'&]/g, "");
+  const [yearStr, monthStr, dayStr] = birthday.split("-");
+  const year = Number(yearStr);
+  const month = Number(monthStr) - 1; // JS months 0-11
+  const day = Number(dayStr);
 
-  // Trim whitespace
-  html = html.trim();
+  const date = new Date(year, month, day);
+  // Check if date matches input (avoids JS auto-correction like Feb 30 -> Mar 2)
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month ||
+    date.getDate() !== day
+  ) {
+    return true; // invalid
+  }
 
-  // Limit length (optional, adjust as needed)
-  html = html.slice(0, 100); // Limit to 100 characters
-
-  return html;
+  return false; // clean
+}
+function sanitizeEmail(email) {
+  const dirtyRegex = /[^A-Za-z0-9.@_-]/g; // allow letters, digits, dot, @, underscore, hyphen
+  return dirtyRegex.test(email); // true = invalid
 }
 export async function handler(event) {
   const logs = [];
@@ -114,26 +139,46 @@ async function handleCreateAccount(event, log, logs) {
   const { username, password, email, birthday } = body;
   log("Fields received:", { username, email, birthday });
 
-  // Sanitize all inputs
-  const sanitizedUsername = sanitizeHtml(username);
-  const sanitizedPassword = sanitizeHtml(password);
-  const sanitizedEmail = sanitizeHtml(email);
-  const sanitizedBirthday = sanitizeHtml(birthday);
-
-  if (
-    !sanitizedUsername ||
-    !sanitizedPassword ||
-    !sanitizedEmail ||
-    !sanitizedBirthday
-  )
+  if (!username || !password || !email || !birthday) {
     return jsonResponse(
       400,
       "ERR_MISSING_FIELDS",
-      "❌ Missing fields",
+      "❌ Required fields are missing",
       {},
       logs
     );
+  }
 
+  if (
+    sanitizeUsername(username) ||
+    sanitizePassword(password) ||
+    sanitizeEmail(email) ||
+    sanitizeBirthday(birthday)
+  ) {
+    return jsonResponse(
+      400,
+      "ERR_INVALID_FIELDS",
+      "❌ Invalid characters in one or more fields",
+      {},
+      logs
+    );
+  }
+  // === Age Check ===
+  const minAge = 10; // minimum allowed age
+  const birthDate = new Date(birthday);
+  const age = Math.floor(
+    (Date.now() - birthDate.getTime()) / (1000 * 60 * 60 * 24 * 365.25)
+  );
+
+  if (age < minAge) {
+    return jsonResponse(
+      400,
+      "ERR_TOO_YOUNG",
+      `❌ You must be at least ${minAge} years old to register`,
+      {},
+      logs
+    );
+  }
   // Check for duplicate username/email using S3 index files
   const usernameKey = `users/by-username/${username.toLowerCase()}.json`;
   const emailKey = `users/by-email/${email.toLowerCase()}.json`;
@@ -252,10 +297,8 @@ async function handleLogin(event, log, logs) {
   const { username, password } = body;
   log("Fields received:", { username });
 
-  // Sanitize inputs
-  const sanitizedUsername = sanitizeHtml(username);
-
-  if (!sanitizedUsername || !password)
+  // Check for missing fields
+  if (!username || !password) {
     return jsonResponse(
       400,
       "ERR_MISSING_FIELDS",
@@ -263,7 +306,18 @@ async function handleLogin(event, log, logs) {
       {},
       logs
     );
+  }
 
+  // Check for invalid characters
+  if (sanitizeUsername(username) || sanitizePassword(password)) {
+    return jsonResponse(
+      400,
+      "ERR_INVALID_FIELDS",
+      "❌ Invalid characters in username or password",
+      {},
+      logs
+    );
+  }
   // Use username index for direct lookup
   const usernameKey = `users/by-username/${username.toLowerCase()}.json`;
   let userId;
@@ -740,15 +794,14 @@ async function handleUpdateSetting(event, log, logs) {
       logs
     );
 
-  // Sanitize inputs
-  const sanitizedKey = sanitizeHtml(key);
-  const sanitizedValue = sanitizeHtml(value);
-
-  if (sanitizedKey !== key || sanitizedValue !== value) {
-    log("⚠️ Input sanitization warning:", {
-      original: { key, value },
-      sanitized: { sanitizedKey, sanitizedValue },
-    });
+  if (sanitizeSetting(key) || sanitizeSetting(value)) {
+    return jsonResponse(
+      400,
+      "ERR_INVALID_FIELDS",
+      "❌ Invalid input fields",
+      {},
+      logs
+    );
   }
 
   try {
