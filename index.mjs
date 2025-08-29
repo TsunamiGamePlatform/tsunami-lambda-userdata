@@ -423,11 +423,16 @@ async function handleLogin(event, log, logs) {
     const token = jwt.sign({ userId, username }, JWT_SECRET, {
       expiresIn: JWT_EXPIRY,
     });
+    const accountDetails = {
+      username: accountJson.username,
+      email: accountJson.email,
+      birthday: accountJson.birthday,
+    };
     return jsonResponse(
       200,
       "SUCCESS_LOGIN",
       "✅ Login successful",
-      { token, config: configJson },
+      { token, config: configJson, accountDetails },
       logs
     );
   } catch (err) {
