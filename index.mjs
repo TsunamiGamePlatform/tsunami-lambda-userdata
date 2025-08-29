@@ -5,6 +5,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   ListObjectsV2Command,
+  DeleteObjectsCommand,
 } from "@aws-sdk/client-s3";
 import jwt from "jsonwebtoken";
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -510,9 +511,41 @@ async function handleGetAccount(event, log, logs) {
 // --- REBUILD INDEXES ---
 async function handleRebuildIndexes(event, log, logs) {
   try {
+    // === Step 0: Clear all existing username/email indexes ===
+    const indexPrefixes = ["users/by-username/", "users/by-email/"];
+    for (const prefix of indexPrefixes) {
+      let ContinuationToken = undefined;
+      do {
+        const listRes = await s3.send(
+          new ListObjectsV2Command({
+            Bucket: BUCKET,
+            Prefix: prefix,
+            ContinuationToken,
+          })
+        );
+
+        const keysToDelete = (listRes.Contents || []).map((obj) => ({
+          Key: obj.Key,
+        }));
+        if (keysToDelete.length) {
+          await s3.send(
+            new DeleteObjectsCommand({
+              Bucket: BUCKET,
+              Delete: { Objects: keysToDelete },
+            })
+          );
+          log(`Cleared ${keysToDelete.length} objects from ${prefix}`);
+        }
+
+        ContinuationToken = listRes.IsTruncated
+          ? listRes.NextContinuationToken
+          : undefined;
+      } while (ContinuationToken);
+    }
+
+    // === Step 1: Rebuild indexes from actual accounts ===
     let ContinuationToken = undefined;
     let rebuilt = 0;
-    let skipped = 0;
 
     do {
       const listRes = await s3.send(
@@ -528,8 +561,8 @@ async function handleRebuildIndexes(event, log, logs) {
         .filter((k) => k.endsWith("account.json"));
 
       for (const key of accountKeys) {
-        const userId = key.split("/")[1]; // users/<uuid>/account.json
         try {
+          const userId = key.split("/")[1]; // users/<uuid>/account.json
           const accountRes = await s3.send(
             new GetObjectCommand({ Bucket: BUCKET, Key: key })
           );
@@ -537,61 +570,36 @@ async function handleRebuildIndexes(event, log, logs) {
             await accountRes.Body.transformToString()
           );
 
+          const ops = [];
+
           const usernameKey = `users/by-username/${accountJson.username.toLowerCase()}.json`;
           const emailKey = `users/by-email/${accountJson.email.toLowerCase()}.json`;
 
-          let needUsername = false;
-          let needEmail = false;
+          ops.push(
+            s3.send(
+              new PutObjectCommand({
+                Bucket: BUCKET,
+                Key: usernameKey,
+                Body: JSON.stringify({ userId }),
+                ContentType: "application/json",
+              })
+            )
+          );
 
-          try {
-            await s3.send(
-              new GetObjectCommand({ Bucket: BUCKET, Key: usernameKey })
-            );
-          } catch (err) {
-            if (err.name === "NoSuchKey") needUsername = true;
-          }
+          ops.push(
+            s3.send(
+              new PutObjectCommand({
+                Bucket: BUCKET,
+                Key: emailKey,
+                Body: JSON.stringify({ userId }),
+                ContentType: "application/json",
+              })
+            )
+          );
 
-          try {
-            await s3.send(
-              new GetObjectCommand({ Bucket: BUCKET, Key: emailKey })
-            );
-          } catch (err) {
-            if (err.name === "NoSuchKey") needEmail = true;
-          }
-
-          const ops = [];
-          if (needUsername) {
-            ops.push(
-              s3.send(
-                new PutObjectCommand({
-                  Bucket: BUCKET,
-                  Key: usernameKey,
-                  Body: JSON.stringify({ userId }),
-                  ContentType: "application/json",
-                })
-              )
-            );
-          }
-          if (needEmail) {
-            ops.push(
-              s3.send(
-                new PutObjectCommand({
-                  Bucket: BUCKET,
-                  Key: emailKey,
-                  Body: JSON.stringify({ userId }),
-                  ContentType: "application/json",
-                })
-              )
-            );
-          }
-
-          if (ops.length) {
-            await Promise.all(ops);
-            rebuilt++;
-            log(`Rebuilt index for userId=${userId}`);
-          } else {
-            skipped++;
-          }
+          await Promise.all(ops);
+          rebuilt++;
+          log(`Rebuilt index for userId=${userId}`);
         } catch (err) {
           log("❌ Failed processing account:", key, err.message);
         }
@@ -606,7 +614,7 @@ async function handleRebuildIndexes(event, log, logs) {
       200,
       "SUCCESS_REBUILD_INDEXES",
       "✅ Index rebuild complete",
-      { rebuilt, skipped },
+      { rebuilt },
       logs
     );
   } catch (err) {
@@ -620,6 +628,7 @@ async function handleRebuildIndexes(event, log, logs) {
     );
   }
 }
+
 // --- GET CONFIG ---
 async function handleGetConfig(event, log, logs) {
   let body;
