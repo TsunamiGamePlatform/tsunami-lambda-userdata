@@ -77,6 +77,8 @@ export async function handler(event) {
       return await handleUpdateSetting(event, log, logs);
     if (route.endsWith("/rebuild-indexes"))
       return await handleRebuildIndexes(event, log, logs);
+    if (route.endsWith("/delete-account"))
+      return await handleDeleteAccount(event, log, logs);
     return jsonResponse(
       404,
       "ERR_ROUTE_NOT_FOUND",
@@ -846,5 +848,115 @@ async function handleUpdateSetting(event, log, logs) {
   } catch (err) {
     log("❌ Failed to update config:", err.message);
     return jsonResponse(500, "ERR_UPDATE_ERROR", "❌ Update error", {}, logs);
+  }
+}
+// --- DELETE ACCOUNT ---
+async function handleDeleteAccount(event, log, logs) {
+  let body;
+  try {
+    body = JSON.parse(event.body || "{}");
+  } catch (err) {
+    log("❌ JSON parse error:", err.message);
+    return jsonResponse(
+      400,
+      "ERR_INVALID_JSON",
+      "❌ Invalid JSON body",
+      {},
+      logs
+    );
+  }
+
+  const { token } = body;
+  let userId;
+
+  try {
+    userId = verifyToken(body, log);
+  } catch (err) {
+    return jsonResponse(
+      401,
+      "ERR_NOT_LOGGED_IN",
+      `❌ Unauthorized: ${err.message}`,
+      {},
+      logs
+    );
+  }
+
+  if (!userId) {
+    return jsonResponse(
+      400,
+      "ERR_MISSING_FIELDS",
+      "❌ Missing userId",
+      {},
+      logs
+    );
+  }
+
+  const userFolder = `users/${userId}`;
+  let accountJson;
+
+  // 1️⃣ Read account.json to get username/email
+  try {
+    const accountRes = await s3.send(
+      new GetObjectCommand({
+        Bucket: BUCKET,
+        Key: `${userFolder}/account.json`,
+      })
+    );
+    accountJson = JSON.parse(await accountRes.Body.transformToString());
+  } catch (err) {
+    log("⚠️ Account file not found, skipping index deletion:", err.message);
+  }
+
+  try {
+    // 2️⃣ Delete main account files
+    const objectsToDelete = [
+      { Key: `${userFolder}/account.json` },
+      { Key: `${userFolder}/config.json` },
+    ];
+
+    await s3.send(
+      new DeleteObjectsCommand({
+        Bucket: BUCKET,
+        Delete: { Objects: objectsToDelete },
+      })
+    );
+    log("✅ Account files deleted");
+
+    // 3️⃣ Delete username/email index files if account.json was read
+    if (accountJson) {
+      const indexObjects = [
+        { Key: `users/by-username/${accountJson.username.toLowerCase()}.json` },
+        { Key: `users/by-email/${accountJson.email.toLowerCase()}.json` },
+      ];
+
+      try {
+        await s3.send(
+          new DeleteObjectsCommand({
+            Bucket: BUCKET,
+            Delete: { Objects: indexObjects },
+          })
+        );
+        log("✅ Username/email index files deleted");
+      } catch (err) {
+        log("❌ Failed to delete index files:", err.message);
+      }
+    }
+
+    return jsonResponse(
+      200,
+      "SUCCESS_DELETE_ACCOUNT",
+      "✅ Account deleted successfully",
+      {},
+      logs
+    );
+  } catch (err) {
+    log("❌ Delete account failed:", err.message);
+    return jsonResponse(
+      500,
+      "ERR_DELETE_ACCOUNT",
+      `❌ Account deletion failed: ${err.message}`,
+      {},
+      logs
+    );
   }
 }
