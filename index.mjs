@@ -77,8 +77,6 @@ export async function handler(event) {
       return await handleUpdateSetting(event, log, logs);
     if (route.endsWith("/rebuild-indexes"))
       return await handleRebuildIndexes(event, log, logs);
-    if (route.endsWith("/delete-account"))
-      return await handleDeleteAccount(event, log, logs);
     return jsonResponse(
       404,
       "ERR_ROUTE_NOT_FOUND",
@@ -281,11 +279,13 @@ async function handleCreateAccount(event, log, logs) {
   );
 }
 
-// --- LOGIN ---
 async function handleLogin(event, log, logs) {
+  log("=== Login attempt started ===");
+
   let body;
   try {
     body = JSON.parse(event.body || "{}");
+    log("Parsed body successfully", { body });
   } catch (err) {
     log("❌ JSON parse error:", err.message);
     return jsonResponse(
@@ -298,21 +298,23 @@ async function handleLogin(event, log, logs) {
   }
 
   const { username, password } = body;
-  log("Fields received:", { username });
+  log("Received fields", { username, passwordProvided: !!password });
 
   // Check for missing fields
   if (!username || !password) {
+    log("❌ Missing username or password");
     return jsonResponse(
       400,
       "ERR_MISSING_FIELDS",
-      "❌ Missing fields",
+      "❌ Missing username or password",
       {},
       logs
     );
   }
 
-  // Check for invalid characters
+  // Sanitize checks
   if (sanitizeUsername(username) || sanitizePassword(password)) {
+    log("❌ Invalid characters detected in username or password");
     return jsonResponse(
       400,
       "ERR_INVALID_FIELDS",
@@ -321,17 +323,23 @@ async function handleLogin(event, log, logs) {
       logs
     );
   }
-  // Use username index for direct lookup
+
+  // Lookup username index (case-insensitive)
   const usernameKey = `users/by-username/${username.toLowerCase()}.json`;
   let userId;
   try {
+    log("Fetching username index from S3", { usernameKey });
     const usernameRes = await s3.send(
       new GetObjectCommand({ Bucket: BUCKET, Key: usernameKey })
     );
     const usernameJson = JSON.parse(await usernameRes.Body.transformToString());
+    log("Username index found", { usernameJson });
     userId = usernameJson.userId;
   } catch (err) {
-    log("❌ Username not found:", err.message);
+    log("❌ Username index fetch failed", {
+      errCode: err.Code,
+      errMessage: err.message,
+    });
     return jsonResponse(
       401,
       "ERR_INVALID_CREDENTIALS",
@@ -341,104 +349,22 @@ async function handleLogin(event, log, logs) {
     );
   }
 
-  // Fetch account file directly
+  // Fetch account.json using userId
   const accountKey = `users/${userId}/account.json`;
+  let accountJson;
   try {
+    log("Fetching account file from S3", { accountKey });
     const accountRes = await s3.send(
       new GetObjectCommand({ Bucket: BUCKET, Key: accountKey })
     );
-    const accountJson = JSON.parse(await accountRes.Body.transformToString());
-    const isMatch =
-      accountJson.username === username &&
-      (await bcrypt.compare(password, accountJson.password));
-    if (!isMatch) {
-      log("❌ Password mismatch");
-      return jsonResponse(
-        401,
-        "ERR_INVALID_CREDENTIALS",
-        "❌ Invalid username or password",
-        {},
-        logs
-      );
-    }
-
-    // ✅ Ensure username/email indexes exist
-    const emailKey = `users/by-email/${accountJson.email.toLowerCase()}.json`;
-    const putIndexOps = [];
-
-    // Check username index
-    try {
-      await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: usernameKey }));
-    } catch (err) {
-      if (err.name === "NoSuchKey") {
-        putIndexOps.push(
-          s3.send(
-            new PutObjectCommand({
-              Bucket: BUCKET,
-              Key: usernameKey,
-              Body: JSON.stringify({ userId }),
-              ContentType: "application/json",
-            })
-          )
-        );
-        log("⚠️ Missing username index recreated");
-      }
-    }
-
-    // Check email index
-    try {
-      await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: emailKey }));
-    } catch (err) {
-      if (err.name === "NoSuchKey") {
-        putIndexOps.push(
-          s3.send(
-            new PutObjectCommand({
-              Bucket: BUCKET,
-              Key: emailKey,
-              Body: JSON.stringify({ userId }),
-              ContentType: "application/json",
-            })
-          )
-        );
-        log("⚠️ Missing email index recreated");
-      }
-    }
-
-    if (putIndexOps.length) {
-      await Promise.all(putIndexOps);
-    }
-
-    // Load config (if exists)
-    let configJson = {};
-    try {
-      const configRes = await s3.send(
-        new GetObjectCommand({
-          Bucket: BUCKET,
-          Key: `users/${userId}/config.json`,
-        })
-      );
-      configJson = JSON.parse(await configRes.Body.transformToString());
-    } catch (err) {
-      log("⚠️ Config load failed, returning empty config:", err.message);
-    }
-
-    const token = jwt.sign({ userId, username }, JWT_SECRET, {
-      expiresIn: JWT_EXPIRY,
-    });
-    const accountDetails = {
-      username: accountJson.username,
-      email: accountJson.email,
-      birthday: accountJson.birthday,
-    };
-    return jsonResponse(
-      200,
-      "SUCCESS_LOGIN",
-      "✅ Login successful",
-      { token, config: configJson, accountDetails },
-      logs
-    );
+    const accountString = await accountRes.Body.transformToString();
+    accountJson = JSON.parse(accountString);
+    log("Account file fetched and parsed", { accountJson });
   } catch (err) {
-    log("❌ Account file error:", err.message);
+    log("❌ Account file fetch failed", {
+      errCode: err.Code,
+      errMessage: err.message,
+    });
     return jsonResponse(
       401,
       "ERR_INVALID_CREDENTIALS",
@@ -447,6 +373,121 @@ async function handleLogin(event, log, logs) {
       logs
     );
   }
+
+  // Check username (case-insensitive) and password
+  const usernameMatches =
+    accountJson.username.toLowerCase() === username.toLowerCase();
+  const passwordMatches = await bcrypt.compare(password, accountJson.password);
+  log("Username match?", { usernameMatches });
+  log("Password match?", { passwordMatches });
+
+  if (!usernameMatches || !passwordMatches) {
+    log("❌ Invalid credentials detected");
+    return jsonResponse(
+      401,
+      "ERR_INVALID_CREDENTIALS",
+      "❌ Invalid username or password",
+      {},
+      logs
+    );
+  }
+
+  log("✅ Username and password validated successfully");
+
+  // Ensure username/email indexes exist
+  const emailKey = `users/by-email/${accountJson.email.toLowerCase()}.json`;
+  const putIndexOps = [];
+
+  try {
+    await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: usernameKey }));
+  } catch (err) {
+    if (err.name === "NoSuchKey") {
+      putIndexOps.push(
+        s3.send(
+          new PutObjectCommand({
+            Bucket: BUCKET,
+            Key: usernameKey,
+            Body: JSON.stringify({ userId }),
+            ContentType: "application/json",
+          })
+        )
+      );
+      log("⚠️ Missing username index recreated");
+    }
+  }
+
+  try {
+    await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: emailKey }));
+  } catch (err) {
+    if (err.name === "NoSuchKey") {
+      putIndexOps.push(
+        s3.send(
+          new PutObjectCommand({
+            Bucket: BUCKET,
+            Key: emailKey,
+            Body: JSON.stringify({ userId }),
+            ContentType: "application/json",
+          })
+        )
+      );
+      log("⚠️ Missing email index recreated");
+    }
+  }
+
+  if (putIndexOps.length) {
+    await Promise.all(putIndexOps);
+    log("✅ Index creation operations completed");
+  }
+
+  // Load config.json if exists
+  let configJson = {};
+  try {
+    const configRes = await s3.send(
+      new GetObjectCommand({
+        Bucket: BUCKET,
+        Key: `users/${userId}/config.json`,
+      })
+    );
+    configJson = JSON.parse(await configRes.Body.transformToString());
+    log("Config loaded successfully", { configJson });
+  } catch (err) {
+    log("⚠️ Config load failed, returning empty config", {
+      errCode: err.Code,
+      errMessage: err.message,
+    });
+  }
+
+  // Create JWT without expiry
+  let token;
+  try {
+    token = jwt.sign({ userId, username: accountJson.username }, JWT_SECRET);
+    log("JWT created successfully", { token });
+  } catch (err) {
+    log("❌ JWT creation failed", { errMessage: err.message });
+    return jsonResponse(
+      500,
+      "ERR_INTERNAL_SERVER_ERROR",
+      "❌ Failed to create JWT",
+      {},
+      logs
+    );
+  }
+
+  const accountDetails = {
+    username: accountJson.username,
+    email: accountJson.email,
+    birthday: accountJson.birthday,
+  };
+
+  log("=== Login successful ===", { username, userId });
+
+  return jsonResponse(
+    200,
+    "SUCCESS_LOGIN",
+    "✅ Login successful",
+    { token, config: configJson, accountDetails },
+    logs
+  );
 }
 
 // --- GET ACCOUNT ---
@@ -848,115 +889,5 @@ async function handleUpdateSetting(event, log, logs) {
   } catch (err) {
     log("❌ Failed to update config:", err.message);
     return jsonResponse(500, "ERR_UPDATE_ERROR", "❌ Update error", {}, logs);
-  }
-}
-// --- DELETE ACCOUNT ---
-async function handleDeleteAccount(event, log, logs) {
-  let body;
-  try {
-    body = JSON.parse(event.body || "{}");
-  } catch (err) {
-    log("❌ JSON parse error:", err.message);
-    return jsonResponse(
-      400,
-      "ERR_INVALID_JSON",
-      "❌ Invalid JSON body",
-      {},
-      logs
-    );
-  }
-
-  const { token } = body;
-  let userId;
-
-  try {
-    userId = verifyToken(body, log);
-  } catch (err) {
-    return jsonResponse(
-      401,
-      "ERR_NOT_LOGGED_IN",
-      `❌ Unauthorized: ${err.message}`,
-      {},
-      logs
-    );
-  }
-
-  if (!userId) {
-    return jsonResponse(
-      400,
-      "ERR_MISSING_FIELDS",
-      "❌ Missing userId",
-      {},
-      logs
-    );
-  }
-
-  const userFolder = `users/${userId}`;
-  let accountJson;
-
-  // 1️⃣ Read account.json to get username/email
-  try {
-    const accountRes = await s3.send(
-      new GetObjectCommand({
-        Bucket: BUCKET,
-        Key: `${userFolder}/account.json`,
-      })
-    );
-    accountJson = JSON.parse(await accountRes.Body.transformToString());
-  } catch (err) {
-    log("⚠️ Account file not found, skipping index deletion:", err.message);
-  }
-
-  try {
-    // 2️⃣ Delete main account files
-    const objectsToDelete = [
-      { Key: `${userFolder}/account.json` },
-      { Key: `${userFolder}/config.json` },
-    ];
-
-    await s3.send(
-      new DeleteObjectsCommand({
-        Bucket: BUCKET,
-        Delete: { Objects: objectsToDelete },
-      })
-    );
-    log("✅ Account files deleted");
-
-    // 3️⃣ Delete username/email index files if account.json was read
-    if (accountJson) {
-      const indexObjects = [
-        { Key: `users/by-username/${accountJson.username.toLowerCase()}.json` },
-        { Key: `users/by-email/${accountJson.email.toLowerCase()}.json` },
-      ];
-
-      try {
-        await s3.send(
-          new DeleteObjectsCommand({
-            Bucket: BUCKET,
-            Delete: { Objects: indexObjects },
-          })
-        );
-        log("✅ Username/email index files deleted");
-      } catch (err) {
-        log("❌ Failed to delete index files:", err.message);
-      }
-    }
-
-    return jsonResponse(
-      200,
-      "SUCCESS_DELETE_ACCOUNT",
-      "✅ Account deleted successfully",
-      {},
-      logs
-    );
-  } catch (err) {
-    log("❌ Delete account failed:", err.message);
-    return jsonResponse(
-      500,
-      "ERR_DELETE_ACCOUNT",
-      `❌ Account deletion failed: ${err.message}`,
-      {},
-      logs
-    );
   }
 }
